@@ -301,9 +301,10 @@ pub fn check_document(
     payload_type: PayloadType,
     document: &RawMap<'_, FxBuildHasher>,
 ) -> Result<()> {
+    println!("check doc called");
     match document.get(RESERVED_VECTORS_FIELD_NAME) {
         Some(_vectors) => {
-            let Ok(Value::Array(_)) = serde_json::from_str(_vectors.get()) else {
+            let Ok(Value::Object(_)) = serde_json::from_str(_vectors.get()) else {
                 return Err((
                     payload_type,
                     UserError::DocumentEmbeddingError("vectors should be an object".into()),
