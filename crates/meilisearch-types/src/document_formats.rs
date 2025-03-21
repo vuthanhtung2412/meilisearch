@@ -6,8 +6,10 @@ use std::marker::PhantomData;
 use bumpalo::Bump;
 use bumparaw_collections::RawMap;
 use memmap2::Mmap;
+use milli::constants::RESERVED_VECTORS_FIELD_NAME;
 use milli::documents::Error;
 use milli::Object;
+use milli::UserError;
 use rustc_hash::FxBuildHasher;
 use serde::de::{SeqAccess, Visitor};
 use serde::{Deserialize, Deserializer};
@@ -90,6 +92,12 @@ impl From<(PayloadType, Error)> for DocumentFormatError {
             Error::Io(e) => Self::Io(e),
             e => Self::MalformedPayload(e, ty),
         }
+    }
+}
+
+impl From<(PayloadType, UserError)> for DocumentFormatError {
+    fn from((ty, error): (PayloadType, UserError)) -> Self {
+        Self::MalformedPayload(milli::documents::Error::InvalidDocumentPayload { error }, ty)
     }
 }
 
@@ -219,11 +227,24 @@ pub fn read_json(input: &File, output: impl io::Write) -> Result<u64> {
 
     let mut out = BufWriter::new(output);
     let mut deserializer = serde_json::Deserializer::from_slice(&input);
+    let mut check_error = None;
     let res = array_each(&mut deserializer, |obj: &RawValue| {
         doc_alloc.reset();
         let map = RawMap::from_raw_value_and_hasher(obj, FxBuildHasher, &doc_alloc)?;
+        match check_document(PayloadType::Json, &map) {
+            Ok(_) => {}
+            Err(e) => {
+                check_error = Some(e);
+                return Ok(());
+            }
+        }
         to_writer(&mut out, &map)
     });
+
+    if let Some(e) = check_error {
+        return Err(e);
+    }
+
     let count = match res {
         // The json data has been deserialized and does not need to be processed again.
         // The data has been transferred to the writer during the deserialization process.
@@ -264,8 +285,9 @@ pub fn read_ndjson(input: &File) -> Result<u64> {
         match result {
             Ok(raw) => {
                 // try to deserialize as a map
-                RawMap::from_raw_value_and_hasher(raw, FxBuildHasher, &bump)
+                let map = RawMap::from_raw_value_and_hasher(raw, FxBuildHasher, &bump)
                     .map_err(|e| DocumentFormatError::from((PayloadType::Ndjson, e)))?;
+                check_document(PayloadType::Ndjson, &map)?;
                 count += 1;
             }
             Err(e) => return Err(DocumentFormatError::from((PayloadType::Ndjson, e))),
@@ -273,6 +295,25 @@ pub fn read_ndjson(input: &File) -> Result<u64> {
     }
 
     Ok(count)
+}
+
+pub fn check_document(
+    payload_type: PayloadType,
+    document: &RawMap<'_, FxBuildHasher>,
+) -> Result<()> {
+    match document.get(RESERVED_VECTORS_FIELD_NAME) {
+        Some(_vectors) => {
+            let Ok(Value::Array(_)) = serde_json::from_str(_vectors.get()) else {
+                return Err((
+                    payload_type,
+                    UserError::DocumentEmbeddingError("vectors should be an object".into()),
+                )
+                    .into());
+            };
+        }
+        None => {}
+    }
+    Ok(())
 }
 
 /// The actual handling of the deserialization process in serde
